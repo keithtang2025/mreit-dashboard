@@ -1,96 +1,152 @@
+import numpy as np
 import pandas as pd
 import yfinance as yf
-from pandas_datareader import data as web
+import streamlit as st
 import matplotlib.pyplot as plt
 
-start = "2018-01-01"
-end   = None
+st.set_page_config(page_title="mREIT Risk Dashboard", layout="wide")
+st.title("mREIT Risk Dashboard — IVR / CIM / AGNC / NLY vs SOFR & HY OAS")
 
-# ------------------------
-# Download stock prices
-# ------------------------
+# ----------------------------
+# Controls
+# ----------------------------
+col1, col2, col3 = st.columns([1.2, 1.2, 1.0])
+with col1:
+    start = st.date_input("Start date", value=pd.to_datetime("2018-01-01"))
+with col2:
+    end = st.date_input("End date", value=pd.Timestamp.today().date())
+with col3:
+    normalize = st.checkbox("Normalize series (start=100)", value=True)
 
-tickers = ["IVR", "CIM", "AGNC", "NLY"]
+tickers_all = ["IVR", "CIM", "AGNC", "NLY"]
+tickers = st.multiselect("Tickers", tickers_all, default=tickers_all)
+rolling = st.slider("Rolling correlation window (days)", 20, 180, 60)
 
-px = yf.download(
-    tickers,
-    start=start,
-    end=end,
-    auto_adjust=True
-)["Close"]
+if not tickers:
+    st.warning("Please select at least one ticker.")
+    st.stop()
 
-# ------------------------
-# Download funding + credit stress indicators
-# ------------------------
+# ----------------------------
+# FRED loader (no pandas_datareader)
+# ----------------------------
+@st.cache_data(ttl=6 * 60 * 60)
+def load_fred_series(series_id: str) -> pd.Series:
+    # FRED provides a simple CSV endpoint
+    url = f"https://fred.stlouisfed.org/graph/fredgraph.csv?id={series_id}"
+    s = pd.read_csv(url)
+    s.columns = ["DATE", series_id]
+    s["DATE"] = pd.to_datetime(s["DATE"])
+    s = s.set_index("DATE")[series_id]
+    s = pd.to_numeric(s, errors="coerce")
+    return s
 
-sofr = web.DataReader("SOFR", "fred", start, end)
-hy_oas = web.DataReader("BAMLH0A0HYM2", "fred", start, end)
+@st.cache_data(ttl=6 * 60 * 60)
+def load_data(tickers, start, end):
+    px = yf.download(
+        tickers,
+        start=str(start),
+        end=str(end),
+        auto_adjust=True,
+        progress=False
+    )["Close"]
 
-# Combine
+    sofr = load_fred_series("SOFR")
+    hy_oas = load_fred_series("BAMLH0A0HYM2")
 
-df = pd.concat([px, sofr, hy_oas], axis=1)
+    df = pd.concat([px, sofr, hy_oas], axis=1)
+    df = df.rename(columns={"SOFR": "SOFR", "BAMLH0A0HYM2": "HY_OAS"})
+    df = df.sort_index().ffill()
 
-df = df.rename(columns={
-    "SOFR": "SOFR",
-    "BAMLH0A0HYM2": "HY_OAS"
-})
+    # Filter to selected date range
+    df = df.loc[pd.to_datetime(start):pd.to_datetime(end)]
+    return df
 
-df = df.sort_index().ffill()
+def normalize_to_100(s: pd.Series) -> pd.Series:
+    s2 = s.dropna()
+    if len(s2) == 0:
+        return s
+    return 100 * s / s2.iloc[0]
 
-# ------------------------
-# Plot 1: normalized comparison
-# ------------------------
+def risk_score(latest_sofr, latest_hy):
+    score = 0
+    if latest_hy >= 7: score += 4
+    elif latest_hy >= 5: score += 3
+    elif latest_hy >= 4: score += 2
+    elif latest_hy >= 3: score += 1
 
-norm = df.copy()
+    if latest_sofr >= 5: score += 3
+    elif latest_sofr >= 4: score += 2
+    elif latest_sofr >= 3: score += 1
 
-for col in norm.columns:
-    norm[col] = 100 * norm[col] / norm[col].dropna().iloc[0]
+    score = min(score, 10)
+    if score <= 2: level = "🟢 Normal"
+    elif score <= 5: level = "🟡 Stress building"
+    elif score <= 8: level = "🟠 Dangerous"
+    else: level = "🔴 Crisis"
+    return score, level
 
-plt.figure(figsize=(14,7))
+df = load_data(tickers, start, end)
 
-plt.plot(norm.index, norm["IVR"], label="IVR", linewidth=2)
-plt.plot(norm.index, norm["CIM"], label="CIM", linewidth=2)
-plt.plot(norm.index, norm["AGNC"], label="AGNC", linewidth=2)
-plt.plot(norm.index, norm["NLY"], label="NLY", linewidth=2)
+if df.dropna().empty:
+    st.error("No data returned. Try a different date range.")
+    st.stop()
 
-plt.plot(norm.index, norm["HY_OAS"], label="HY Spread", linestyle="--")
-plt.plot(norm.index, norm["SOFR"], label="SOFR", linestyle="--")
+latest = df.dropna().iloc[-1]
+score, level = risk_score(latest["SOFR"], latest["HY_OAS"])
 
-plt.title("Mortgage REIT vs Funding Stress vs Credit Spread")
+m1, m2, m3 = st.columns(3)
+m1.metric("SOFR (%)", f"{latest['SOFR']:.2f}")
+m2.metric("HY OAS (%)", f"{latest['HY_OAS']:.2f}")
+m3.metric("Risk score (0-10)", f"{score}  {level}")
 
+st.divider()
+
+# ----------------------------
+# Plot 1
+# ----------------------------
+plot_df = df.copy()
+if normalize:
+    for c in tickers + ["SOFR", "HY_OAS"]:
+        plot_df[c] = normalize_to_100(plot_df[c])
+
+fig = plt.figure(figsize=(14, 6))
+for t in tickers:
+    plt.plot(plot_df.index, plot_df[t], label=t, linewidth=2)
+plt.plot(plot_df.index, plot_df["SOFR"], label="SOFR", linestyle="--")
+plt.plot(plot_df.index, plot_df["HY_OAS"], label="HY OAS", linestyle="--")
+plt.title("Normalized comparison" if normalize else "Levels")
+plt.grid(True)
 plt.legend()
+st.pyplot(fig, use_container_width=True)
 
+# ----------------------------
+# Plot 2: rolling correlation
+# ----------------------------
+st.subheader("Rolling correlation (stock returns vs changes in HY_OAS & SOFR)")
+
+corr_df = pd.DataFrame(index=df.index)
+for t in tickers:
+    corr_df[f"{t} vs HY_OAS"] = df[t].pct_change().rolling(rolling).corr(df["HY_OAS"].diff())
+    corr_df[f"{t} vs SOFR"] = df[t].pct_change().rolling(rolling).corr(df["SOFR"].diff())
+
+fig2 = plt.figure(figsize=(14, 5))
+for c in corr_df.columns:
+    plt.plot(corr_df.index, corr_df[c], label=c)
+plt.axhline(0, linewidth=1)
+plt.title(f"{rolling}-day rolling correlation")
 plt.grid(True)
+plt.legend(ncols=2)
+st.pyplot(fig2, use_container_width=True)
 
-plt.show()
+st.divider()
 
+st.subheader("Data preview")
+st.dataframe(df.tail(20), use_container_width=True)
 
-# ------------------------
-# Plot 2: dual axis
-# ------------------------
-
-fig, ax1 = plt.subplots(figsize=(14,7))
-
-ax1.plot(df.index, df["IVR"], label="IVR")
-ax1.plot(df.index, df["CIM"], label="CIM")
-ax1.plot(df.index, df["AGNC"], label="AGNC")
-ax1.plot(df.index, df["NLY"], label="NLY")
-
-ax1.set_ylabel("Stock Price")
-
-ax1.legend(loc="upper left")
-
-ax2 = ax1.twinx()
-
-ax2.plot(df.index, df["HY_OAS"], label="HY Spread", linestyle="--")
-ax2.plot(df.index, df["SOFR"], label="SOFR", linestyle="--")
-
-ax2.set_ylabel("Rate / Spread")
-
-ax2.legend(loc="upper right")
-
-plt.title("Mortgage REIT vs Repo Funding Stress")
-
-plt.grid(True)
-
-plt.show()
+csv = df.to_csv().encode("utf-8")
+st.download_button(
+    "Download combined CSV",
+    data=csv,
+    file_name="mreit_dashboard_data.csv",
+    mime="text/csv"
+)
