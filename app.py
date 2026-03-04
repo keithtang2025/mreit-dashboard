@@ -14,7 +14,7 @@ col1, col2, col3 = st.columns([1.2, 1.2, 1.0])
 with col1:
     start = st.date_input("Start date", value=pd.to_datetime("2018-01-01"))
 with col2:
-    end = st.date_input("End date", value=pd.Timestamp.today().date())
+    end = st.date_input("End date", value=(pd.Timestamp.today() - pd.Timedelta(days=1)).date())
 with col3:
     normalize = st.checkbox("Normalize series (start=100)", value=True)
 
